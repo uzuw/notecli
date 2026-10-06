@@ -17,37 +17,34 @@ $ note rm                   # fuzzy multi-select -> trash (recoverable)
 
 ```sh
 make install                # symlinks ./note into ~/.local/bin
-make test                   # pytest suite
+make test                   # 47 tests
 ```
 
 Requires Python 3.11+ (stdlib only, no dependencies). Recommended companions: `nvim`, `fzf`,
-`ripgrep` (regex search). Everything degrades gracefully without them — notes are plain Markdown, and
-the CLI falls back to a numbered picker when `fzf` is unavailable or stdin is not a terminal.
+`ripgrep` — all optional. Without them `note` falls back to `$EDITOR`, a numbered picker and indexed
+substring search. The same script is attached to the [latest
+release](https://github.com/uzuw/notecli/releases); download it, `chmod +x`, put it on `PATH`.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `note` / `note new [title]` | Open the editor on a new note. Empty drafts are discarded. |
-| `note add [text]` | Capture without the editor (args or stdin). |
-| `note append [text]` | Append to the newest note (`--to REF` to target another, `--bullet` for `- HH:MM text`). |
-| `note ls [query]` | Newest-first list in fzf; enter opens. |
-| `note find <query>` | Indexed full-text search, ranked by relevance; enter opens. |
-| `note find -e <regex>` | Regex search via ripgrep with matching lines as preview. |
-| `note show <ref>` | Print a note raw (`--json` for metadata). |
-| `note open <ref>` | Open by id, filename fragment, or fuzzy query (`--pick` to force the picker). |
-| `note last` | Open the most recent note (`--show` to print it). |
-| `note rm [query]` | Multi-select and move to trash (`--purge` for permanent, `-y` to skip the prompt). |
+| `note add [text]` | Capture without the editor (arguments or stdin). |
+| `note append [text]` | Append to the newest note (`--to REF`, `--bullet` for `- HH:MM text`). |
+| `note ls [query]` | Newest-first list in the fzf picker; enter opens. |
+| `note find <query>` | Ranked full-text search; enter opens. `-e` for ripgrep regex. |
+| `note show <ref>` | Print a note (`--preview` for the coloured view, `--json` for metadata). |
+| `note open <ref>` | Open by id, filename fragment, path or query. |
+| `note last` | Open the newest note (`--show` to print it). |
+| `note rm [query]` | Multi-select and move to trash (`--purge`, `-y`, `-a`). |
 | `note restore` | Put trashed notes back where they were. |
 | `note tags` / `note tag <name>` | Tag counts / notes carrying a tag. |
-| `note reindex` | Rebuild the index from files. |
-| `note gc [--days N]` | Purge trash entries older than N days (`--all` for everything). |
-| `note where` | Paths, editor, index stats. |
+| `note reindex`, `note gc`, `note where` | Rebuild the index, purge trash, show paths and stats. |
 
-`ls`, `find` and `rm` share the same filters: `-t/--tag`, `--since`, `--until` (`today`, `yesterday`,
-`-7d`, `2026-10-01`), `--cwd`, `--host`; `ls`, `find` and `tag` take `-p/--print-path`.
-`note add/new/append/ls/find/show/tags/where` take `--json` for scripting; `-q/--quiet` suppresses
-chatter on the capture commands.
+Filters: `ls` takes `-t/--tag` and `--since`; `find` takes `-t/--tag`, `--since`, `--until`, `--cwd`,
+`--host`; `rm` takes `-t/--tag`. `ls`, `find` and `tag` take `-p/--print-path`.
+`add/new/append/ls/find/show/tags/where` take `--json` for scripting.
 
 `note` with no arguments is the hot path, so bind it: `alias n=note`, a tmux key
 (`bind n display-popup -E note`), or a desktop keybind running `foot -e note`.
@@ -61,66 +58,41 @@ chatter on the capture commands.
 └── trash/2026-10-06_151233/2026/10/2026-10-06_143205-fix-flaky-ci.md
 ```
 
-The Markdown files are the only source of truth. The index is rebuilt from file mtime/size on every
-command, so editing, renaming or deleting notes by hand (or with nvim plugins) is reflected
-automatically — `note reindex` only matters if the `.db` is lost or corrupted.
+Markdown files are the only source of truth; the index is resynced from file mtime/size on every
+command, so editing, renaming or deleting notes by hand is reflected automatically. Each note
+records the context it was captured in — `cwd`, host, git `branch@sha`, tmux session — in its front
+matter, and inline `#hashtags` become tags.
 
-Each note carries the context it was captured in:
+Config lives in `~/.config/note/config.toml` (`root`, `editor`, `template`, `fzf_opts`, `limit`);
+environment: `NOTE_HOME`, `NOTE_EDITOR`, `NOTE_NO_FZF`, `NO_COLOR`.
 
-```markdown
----
-id: 20261006-143205-a1b2
-title: Fix flaky CI
-created: 2026-10-06T14:32:05+05:45
-updated: 2026-10-06T14:41:11+05:45
-tags: [ci, python]
-cwd: /home/you/code/api
-host: laptop
-git: main@4f2c1ab
-session: work:2.1
-source: editor
----
+## Documentation
 
-Free-form Markdown body. Inline #hashtags become tags.
-```
+Full documentation is in [`project_docs/simple_note/`](project_docs/simple_note/):
 
-`note` only rewrites front matter when the body changed (to bump `updated`) or when appending, so
-hand edits to unknown YAML keys survive. Hashtags found in the body are merged into `tags`.
-
-## Configuration
-
-`~/.config/note/config.toml`, all keys optional:
-
-```toml
-root = "~/notes"            # where notes/ , trash/ and index.db live
-editor = "nvim -f"          # editor command (see precedence below)
-template = "# {title}\n\n"  # body pre-filled in new notes
-fzf_opts = "--height=90% --layout=reverse --border --info=inline"
-limit = 50                  # default number of rows in pickers
-```
-
-Precedence for the editor: `--editor` > `$NOTE_EDITOR` > `config.editor` > `nvim` if installed >
-`$VISUAL`/`$EDITOR` > `vi`. `nvim`/`vim` are launched at the end of the file (`+`). Other environment
-variables: `NOTE_HOME` (root), `NOTE_NO_FZF=1` (force the built-in picker), `NO_COLOR` (no ANSI).
-
-`--root` overrides everything, which is handy for scratch notebooks: `note --root /tmp/scratch ls`.
-
-## Notes on behaviour
-
-- The editor flow writes a draft in `<root>/.tmp/`, then slugs the final filename from the edited
-  `title:` (or the first body line). If the buffer is left empty the draft is deleted — no empty
-  notes, ever.
-- `rm` moves notes to `trash/<timestamp>/` preserving their path and a `.meta` pointer, so
-  `note restore` is lossless.
-- Interrupted or concurrent runs are safe: writes are atomic (`os.replace`) and deletes only touch
-  paths the index knows about.
+| Doc | Contents |
+| --- | --- |
+| [commands.md](project_docs/simple_note/commands.md) | Every command, flag, exit code and JSON shape |
+| [architecture.md](project_docs/simple_note/architecture.md) | Capture flows, index sync, search pipeline, design decisions |
+| [storage.md](project_docs/simple_note/storage.md) | On-disk layout, front matter contract, index schema, recovery |
+| [configuration.md](project_docs/simple_note/configuration.md) | `config.toml`, environment, editor and picker precedence |
+| [development.md](project_docs/simple_note/development.md) | Test strategy, verification playbook, release checklist |
+| [changelog.md](project_docs/simple_note/changelog.md) | Released and unreleased changes |
 
 ## Development
 
 ```sh
-make test        # pytest tests/ (43 tests, no network, isolated NOTE_HOME)
+make test        # pytest tests/ — isolated NOTE_HOME, stubbed editor, real fzf on a pty
 make check       # byte-compile the CLI
 ```
 
-The whole tool is the single executable file `note` (stdlib only, no dependencies). Tests drive the
-real binary as a subprocess with a stubbed editor; one test runs the real `fzf` picker on a pty.
+The entire tool is the single executable file `note`. See
+[development.md](project_docs/simple_note/development.md) for the test strategy and the release
+checklist.
+
+## Known limitations
+
+- Linux/POSIX only; not exercised on macOS or Windows.
+- The fzf multi-select plus delete-confirmation pair has been verified in parts, not in one
+  interactive session.
+- Local, single-user: no sync, multi-device or encryption.
