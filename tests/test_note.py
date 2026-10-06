@@ -518,3 +518,72 @@ def test_fzf_picker_opens_the_selected_note(env, tmp_path):
     assert rc == 0, screen[-800:]
     opened = editor_log.read_text().strip()
     assert opened.endswith("-kafka-compaction-strategy.md"), opened
+
+
+# --------------------------------------------------------------------------- drafts
+
+
+def make_draft(note_mod, tmp_path, body: str, age_days: float = 0) -> Path:
+    """Simulate a run that died before it could file or discard its draft."""
+    import time
+
+    cfg = note_mod.load_config(str(tmp_path / "data"), None)
+    note_mod.ensure_dirs(cfg)
+    meta, _now = note_mod.new_meta(cfg, "", [], "editor")
+    draft = cfg.tmp / f"{meta['id']}.md"
+    note_mod.write_note(draft, meta, body + "\n")
+    if age_days:
+        old = time.time() - age_days * 86400
+        os.utime(draft, (old, old))
+    return draft
+
+
+def test_recover_files_abandoned_drafts(env, tmp_path, note_mod):
+    draft = make_draft(note_mod, tmp_path, "half typed thought during a crash")
+    r = run(env, "recover", "-a")
+    assert r.returncode == 0 and "recovered" in r.stdout
+    assert not draft.exists()
+    row = json.loads(run(env, "ls", "--json").stdout)[0]
+    assert row["title"] == "half typed thought during a crash"
+    assert row["body"].startswith("half typed")
+    assert row["source"] == "editor"
+
+
+def test_recover_is_a_no_op_without_drafts(env):
+    r = run(env, "recover")
+    assert r.returncode == 0 and "no drafts to recover" in r.stderr
+
+
+def test_gc_prunes_stale_drafts_but_protects_live_ones(env, tmp_path, note_mod):
+    old = make_draft(note_mod, tmp_path, "abandoned weeks ago", age_days=40)
+    fresh = make_draft(note_mod, tmp_path, "draft an editor may still have open")
+    assert run(env, "gc", "--all").returncode == 0
+    assert not old.exists()
+    assert fresh.exists(), "a draft younger than an hour must survive even --all"
+    assert run(env, "gc", "-d", "1").returncode == 0
+    assert fresh.exists()
+
+
+def test_where_reports_draft_count(env, tmp_path, note_mod):
+    assert json.loads(run(env, "where", "--json").stdout)["drafts"] == 0
+    make_draft(note_mod, tmp_path, "pending")
+    assert json.loads(run(env, "where", "--json").stdout)["drafts"] == 1
+    assert "note recover" in run(env, "where").stdout
+
+
+def test_index_runs_in_wal_with_a_busy_timeout(note_mod, tmp_path):
+    conn = note_mod.connect(note_mod.load_config(str(tmp_path / "data"), None))
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
+    conn.close()
+
+
+# --------------------------------------------------------------------------- fallbacks
+
+
+def test_regex_search_falls_back_to_index_without_ripgrep(env, tmp_path):
+    run(env, "add", "Kafka rebalance storm")
+    r = run(env, "find", "-e", "rebalance storm", "--json", extra_env={"PATH": "/nonexistent"})
+    assert r.returncode == 0, r.stderr
+    assert [n["title"] for n in json.loads(r.stdout)] == ["Kafka rebalance storm"]
+
