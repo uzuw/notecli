@@ -26,6 +26,12 @@ from pathlib import Path
 
 APP = "note"
 VERSION = "0.1.0"
+# every subcommand name and alias; kept in sync with build_parser() by a test
+COMMANDS = (
+    "new", "n", "add", "a", "q", "append", "ap", "ls", "list", "l", "find", "f", "search", "s",
+    "show", "cat", "open", "edit", "e", "last", "rm", "delete", "d", "restore", "undo", "tags", "t",
+    "tag", "reindex", "gc", "where", "info",
+)
 DEFAULT_FZF_OPTS = "--height=90% --layout=reverse --border --info=inline"
 SNIPPET_LEN = 72
 
@@ -340,6 +346,7 @@ class Note:
             "session": self.session,
             "source": self.source,
             "body": self.body,
+            "snippet": self.snippet,
         }
         if cfg:
             d["rel"] = str(self.path.relative_to(cfg.root)) if str(self.path).startswith(str(cfg.root)) else str(self.path)
@@ -1002,7 +1009,8 @@ def pick_and_open(args, cfg: Cfg, conn: sqlite3.Connection, rows, prompt: str, q
     print_path = getattr(args, "print_path", False)
     if not sys.stdin.isatty() or print_path or args.json:
         if args.json:
-            print(json.dumps([n.as_json(cfg) for n in notes], indent=2))
+            # list rows only carry the indexed snippet; read files so `body` always means the full body
+            print(json.dumps([read_note(n.path).as_json(cfg) for n in notes], indent=2))
         else:
             for n in notes:
                 line = display_line(n, now, use_color())
@@ -1336,7 +1344,8 @@ def cmd_gc(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
         for leftover in list(cfg.trash.iterdir()):
             if leftover.is_file():
                 leftover.unlink()
-    print(f"{APP}: purged {purged} file(s) from trash (older than {args.days}d)")
+    scope = "all trash" if args.all else f"older than {args.days}d"
+    print(f"{APP}: purged {purged} file(s) from trash ({scope})")
     return 0
 
 
@@ -1385,8 +1394,8 @@ def build_parser() -> argparse.ArgumentParser:
     # same flags again on every subcommand so they work after the command word too;
     # SUPPRESS keeps the top-level values when only the global form is used
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--root", help=argparse.SUPPRESS)
-    common.add_argument("--editor", help=argparse.SUPPRESS)
+    common.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("--editor", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     common.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd")
@@ -1491,6 +1500,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
+    # "note buy milk" is a title, not a typo'd subcommand: only the first word is considered, so a
+    # leading global flag (--root/--editor/--json) still parses normally
+    if argv and not argv[0].startswith("-") and argv[0] not in COMMANDS:
+        argv = ["new", *argv]
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
         args = parser.parse_args(["new", *argv])

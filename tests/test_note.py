@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.machinery
 import importlib.util
 import json
@@ -330,6 +331,14 @@ def test_find_matches_title_and_body(env, tmp_path):
     assert [n["title"] for n in json.loads(run(env, "find", "searchable", "--json").stdout)] == ["searchable title"]
 
 
+def test_list_json_carries_full_body_and_snippet(env, tmp_path):
+    run(env, "add", stdin="multi line note\nfirst body line here\nsecond body line here\n")
+    row = json.loads(run(env, "ls", "--json").stdout)[0]
+    assert row["body"] == "first body line here\nsecond body line here\n"
+    assert row["snippet"] == "first body line here"
+    assert row["rel"].startswith("notes/")
+
+
 def test_find_substring_fallback_for_punctuation(env, tmp_path):
     run(env, "add", "punctuation case: x-y?z!")
     # tokens survive FTS tokenization, so the plain path already matches
@@ -448,6 +457,25 @@ def test_last_show_returns_newest(env, tmp_path):
     run(env, "add", "second note")
     r = run(env, "last", "--show")
     assert r.returncode == 0 and "second note" in r.stdout
+
+
+def test_bare_words_become_a_new_note_title(env, tmp_path):
+    r = run(env, "buy", "milk", extra_env={"FAKE_BODY": "two litres"})
+    assert r.returncode == 0, r.stderr
+    row = json.loads(run(env, "ls", "--json").stdout)[0]
+    assert row["title"] == "buy milk"
+    assert row["source"] == "editor"
+
+
+def test_global_flags_still_work_in_front(env, tmp_path):
+    assert run(env, "--json", "where").stdout.startswith("{")
+    assert json.loads(run(env, "--root", str(tmp_path / "other"), "where", "--json").stdout)["root"] == str(tmp_path / "other")
+
+
+def test_command_table_matches_parser(note_mod):
+    parser = note_mod.build_parser()
+    choices = {c for action in parser._actions if isinstance(action, argparse._SubParsersAction) for c in action.choices}
+    assert choices == set(note_mod.COMMANDS), "COMMANDS drifted from build_parser()"
 
 
 def test_editor_command_is_nvim_plus_position(env, tmp_path, monkeypatch, note_mod):
