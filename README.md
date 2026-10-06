@@ -17,7 +17,7 @@ $ note rm                   # fuzzy multi-select -> trash (recoverable)
 
 ```sh
 make install                # symlinks ./note into ~/.local/bin
-make test                   # 47 tests
+make test                   # 53 tests
 ```
 
 Requires Python 3.11+ (stdlib only, no dependencies). Recommended companions: `nvim`, `fzf`,
@@ -39,6 +39,7 @@ release](https://github.com/uzuw/notecli/releases); download it, `chmod +x`, put
 | `note last` | Open the newest note (`--show` to print it). |
 | `note rm [query]` | Multi-select and move to trash (`--purge`, `-y`, `-a`). |
 | `note restore` | Put trashed notes back where they were. |
+| `note recover` | File drafts left behind by a killed run (`where` counts them). |
 | `note tags` / `note tag <name>` | Tag counts / notes carrying a tag. |
 | `note reindex`, `note gc`, `note where` | Rebuild the index, purge trash, show paths and stats. |
 

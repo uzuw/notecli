@@ -236,6 +236,26 @@ Purges trash buckets: `-d/--days N` (default 30) keeps buckets newer than N days
 everything. Stray files left directly in the trash root are removed too. Bucket age comes from the
 timestamp in the bucket directory name, falling back to its mtime.
 
+It also prunes *abandoned drafts* in `.tmp/` (see [`note recover`](#note-recover)) using the same
+age limit. Drafts modified within the last hour are never touched, even with `--all`, so a draft that
+an editor session still has open cannot be deleted underneath it.
+
+### `note recover`
+
+Files drafts left behind when a run was killed before it could finish (process killed, terminal
+closed, power loss). Drafts are not searchable by design — they live in `.tmp/`, outside the indexed
+tree — so `note where` reports how many are waiting. `note recover` lists them in the picker
+(`tab` to multi-select) and files the selection as ordinary notes: title from the draft, timestamp
+from when the draft was created, then indexed like any capture. `-a` takes everything without the
+picker; without a terminal it files every draft.
+
+```sh
+note where            # "drafts: 2  (… 'note recover' files them, 'note gc' prunes them)"
+note recover          # pick which drafts to file
+note recover -a       # file all of them
+note gc -d 7          # or throw away drafts older than a week
+```
+
 ### `note reindex`
 
 Drops and rebuilds the whole index from the note files. Rarely needed: every command already
@@ -244,7 +264,8 @@ resyncs changed, new and deleted files from mtime/size.
 ### `note where` (`info`)
 
 Prints root, notes, trash and index paths, the resolved config file, editor, availability of `fzf`
-and `rg`, note count, newest note, index size, and the `NOTE_*` environment variables.
+and `rg`, note count, newest note, index size, the number of abandoned drafts, and the `NOTE_*`
+environment variables.
 
 ---
 
@@ -271,7 +292,7 @@ Note objects (returned by `add`/`new`, `ls`, `find`, `tag`, `show`) contain:
 }
 ```
 
-`tags` (per tag), `where` (see above) and `reindex`/`rm`/`restore`/`gc` (text only) differ; `find`
+`tags` (per tag), `where` (see above) and `reindex`/`rm`/`restore`/`recover`/`gc` (text only) differ; `find`
 and `ls` return arrays, `show --json` returns an array with one object per note.
 
 Empty result sets print `[]` and exit `1`, so scripts can distinguish "no hits" from "bad usage"

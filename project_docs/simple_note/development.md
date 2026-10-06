@@ -4,7 +4,7 @@
 
 ```
 note                        # the entire CLI: one executable Python file, no dependencies
-tests/test_note.py          # 47 pytest cases driving the real binary
+tests/test_note.py          # 53 pytest cases driving the real binary
 Makefile                    # install / uninstall / test / check
 README.md                   # user-facing quick start (root of the repo)
 project_docs/simple_note/   # these documents
@@ -57,6 +57,8 @@ Coverage map:
 | References | by id, filename stem, `.md` basename, notes-relative path, title fragment, unknown ref |
 | Deletion | confirm/abort, trash layout + `.meta`, `--purge`, piped-without-`-y` refusal, restore, gc |
 | Output contracts | `--json` shapes, full `body` vs `snippet`, exit codes |
+| Drafts | abandoned draft recovered into a filed note, `gc` prunes stale ones while protecting fresh ones, `where` counts them |
+| Fallbacks | regex search falls back to the index when ripgrep is absent, WAL + busy timeout asserted |
 | Editor invocation | `nvim` gets `+`; other editors do not |
 
 Known gaps in coverage (see also the release notes): the fzf multi-select plus delete-confirmation

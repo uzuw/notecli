@@ -21,5 +21,5 @@ projects' docs live in sibling directories under `project_docs/`.
 - They describe the behaviour of the code in this repository, and are updated in the same commit
   as the change they describe. Where the working tree differs from the latest tag, the difference
   is listed under *Unreleased* in [changelog.md](changelog.md).
-- The latest release is `v0.1.0`; `note --version` prints the version of the script you are running.
+- The latest release is `v0.1.1`; `note --version` prints the version of the script you are running.
 - Examples assume `note` is on `PATH` (`make install`).

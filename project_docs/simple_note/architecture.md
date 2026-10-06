@@ -109,6 +109,8 @@ Trash lives under the same root, so a backup of the notes root also backs up wha
 | Index schema changes between versions | `connect()` adds missing columns (`snippet`) and clears mtimes so affected rows are reparsed. |
 | Editor exits non-zero | Reported on stderr; a non-empty draft is still saved, an empty one is discarded. |
 | Draft deleted by the editor | `note` reports "draft vanished, nothing saved" and exits non-zero. |
+| `note` killed mid-edit (or power loss) | The draft survives in `.tmp/`, invisible to search; `note where` counts it, `note recover` files it, `note gc` prunes it (1 h floor). |
+| Two `note` processes at once | SQLite WAL + 10 s busy timeout: readers never queue behind writers; writers wait for each other instead of failing. |
 | `fzf`/`rg`/`nvim` missing | Numbered picker / indexed substring search / `$VISUAL`/`$EDITOR`/`vi`. |
 | Broken `config.toml` | Warning on stderr, defaults used; the tool never refuses to run because of config. |
 | `rm` on a pipe without `-y` | Refuses with exit `1` instead of guessing. |

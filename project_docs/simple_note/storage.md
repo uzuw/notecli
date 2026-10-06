@@ -14,7 +14,10 @@
 - Notes are namespaced by creation **year/month directories** and by a **full timestamp in the
   filename** (`YYYY-MM-DD_HHMMSS-slug.md`), so the tree is self-describing and sorts chronologically
   even without the index. Collisions within the same second get a `-2`, `-3` suffix.
-- Drafts live in `.tmp/` so an interrupted editor session is not searchable.
+- Drafts live in `.tmp/` so an interrupted editor session is not searchable. A draft is
+  deleted as soon as the note is filed or found to be empty; if the process dies first it stays
+  until `note recover` files it or `note gc` prunes it (drafts younger than an hour are always
+  kept, even by `gc --all`).
 - Trash preserves the original relative path inside a timestamped bucket
   (`trash/<YYYY-MM-DD_HHMMSS>/notes/2026/10/...`), so a restore is a plain move back.
 
@@ -95,5 +98,7 @@ CREATE VIRTUAL TABLE notes_fts USING fts5(title, body, tags, tokenize="unicode61
 | Note restored from a backup without front matter | It is indexed anyway; title/timestamp come from the body and filename |
 | Deleted a note by mistake | `note restore` (picker), `note restore -a` (everything) |
 | Trash growing | `note gc -d 7`, or `--all` to empty it |
+| `note where` reports abandoned drafts | `note recover` files them (timestamp comes from the draft), `note gc` prunes them |
+| `index.db-wal` / `index.db-shm` next to the index | Normal for SQLite WAL mode; they checkpoint away, and both are as disposable as `index.db` |
 | Want a second, throwaway notebook | `note --root /tmp/scratch …` or `NOTE_HOME=/tmp/scratch note …` |
 | Backups | Copy the root; `notes/` is the value, `index.db` is disposable |

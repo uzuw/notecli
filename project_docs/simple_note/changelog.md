@@ -5,8 +5,18 @@ All notable changes to `note`. Versions follow `MAJOR.MINOR.PATCH`; the version 
 
 ## Unreleased
 
+_Nothing yet._
+
+## 0.1.1 — 2026-10-06
+
 ### Added
 
+- `note recover` files drafts left behind by an interrupted run (killed process, lost power). Such
+  drafts are invisible to search by design; `note where` now reports their count and points at both
+  `note recover` (file them) and `note gc` (prune them).
+- `note gc` prunes abandoned drafts as well as trash buckets: `-d/--days` (default 30) sets the age
+  limit and `--all` removes every draft, in both cases with a one-hour floor so a draft that an open
+  editor session is still using is never deleted.
 - `note <words>` now starts a new note titled with those words (previously argparse exited `2` on the
   unrecognized command word). Only the first word is inspected, so `note --root X ls` still parses,
   and titles colliding with a command name need `note new <title>`.
@@ -22,6 +32,13 @@ All notable changes to `note`. Versions follow `MAJOR.MINOR.PATCH`; the version 
 - `note gc --all` printed "(older than 30d)" regardless of scope; it now says "(all trash)".
 - `note tag <name> -p` was rejected by the argument parser even though the list/pick path supported
   printing (`ls`/`find` had `-p`; `tag` was missing it).
+
+### Changed
+
+- The index runs in SQLite WAL mode with a 10 s busy timeout and `synchronous=NORMAL`. Readers
+  (pickers, listings, searches) no longer queue behind a concurrent writer: measured 0.07 s for
+  `note ls` while another process held a write transaction, where the default rollback journal
+  stalled the connection for up to 5 s.
 
 ## 0.1.0 — 2026-10-06
 
