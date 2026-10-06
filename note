@@ -1,0 +1,1510 @@
+#!/usr/bin/env python3
+"""note - frictionless note capture into nvim with dated, timestamped, searchable notes.
+
+Files are the source of truth: plain Markdown with YAML front matter under
+<root>/notes/YYYY/MM/YYYY-MM-DD_HHMMSS-slug.md. A derived SQLite FTS5 index
+(<root>/index.db) is resynced from file mtimes on every command that needs it,
+so hand edits, renames and deletions are picked up automatically.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+APP = "note"
+VERSION = "0.1.0"
+DEFAULT_FZF_OPTS = "--height=90% --layout=reverse --border --info=inline"
+SNIPPET_LEN = 72
+
+C_RESET = "\033[0m"
+C_DIM = "\033[2m"
+C_DATE = "\033[36m"
+C_TAG = "\033[35m"
+C_TITLE = "\033[1m"
+C_SNIP = "\033[2m"
+
+
+# --------------------------------------------------------------------------- util
+
+
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def die(msg: str, code: int = 1) -> "None":
+    print(f"{APP}: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def use_color(stream=None) -> bool:
+    stream = stream or sys.stdout
+    if os.environ.get("NO_COLOR"):
+        return False
+    return hasattr(stream, "isatty") and stream.isatty()
+
+
+def c(text: str, code: str, on: bool) -> str:
+    return f"{code}{text}{C_RESET}" if on else text
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.pop("timeout", 2), **kw)
+
+
+def git_context(cwd: Path) -> str:
+    try:
+        br = run(["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"])
+        if br.returncode != 0:
+            return ""
+        sha = run(["git", "-C", str(cwd), "rev-parse", "--short", "HEAD"])
+        branch = br.stdout.strip()
+        return f"{branch}@{sha.stdout.strip()}" if sha.returncode == 0 else branch
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def tmux_context() -> str:
+    if not os.environ.get("TMUX") or not have("tmux"):
+        return ""
+    try:
+        r = run(["tmux", "display-message", "-p", "#S:#I.#P"], timeout=1)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def slugify(text: str, max_words: int = 6, max_len: int = 48) -> str:
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^\w\s-]", " ", text.lower())
+    words = [w for w in re.split(r"[\s_\-]+", text) if w][:max_words]
+    return ("-".join(words)[:max_len].strip("-")) or "note"
+
+
+def parse_when(spec: str) -> datetime | None:
+    """Accept ISO date/datetime, 'today', 'yesterday', '-7d', '7d', '2w', '3m', '1y'."""
+    if not spec:
+        return None
+    s = spec.strip().lower()
+    now = datetime.now().astimezone()
+    rel = re.fullmatch(r"-?(\d+)\s*([dwmy])", s)
+    if rel:
+        n, unit = int(rel.group(1)), rel.group(2)
+        days = {"d": 1, "w": 7, "m": 30, "y": 365}[unit] * n
+        return (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if s == "today":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if s == "yesterday":
+        return (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if s in ("now",):
+        return now
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(spec, fmt).astimezone()
+        except ValueError:
+            continue
+    die(f"unrecognized date: {spec!r}")
+
+
+def iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat()
+
+
+def fmt_age(epoch: float, now: datetime) -> str:
+    if not epoch:
+        return "?"
+    delta = now.timestamp() - epoch
+    if delta < 60:
+        return "now"
+    for limit, div, unit in ((3600, 60, "m"), (86400, 3600, "h"), (86400 * 30, 86400, "d")):
+        if delta < limit:
+            return f"{int(delta // div)}{unit}"
+    return datetime.fromtimestamp(epoch).astimezone().strftime("%Y-%m-%d")
+
+
+# --------------------------------------------------------------------------- config
+
+
+@dataclass
+class Cfg:
+    root: Path
+    notes: Path
+    trash: Path
+    tmp: Path
+    db: Path
+    editor: list[str]
+    fzf_opts: str
+    template: str
+    limit: int
+    config_file: Path | None = None
+    config: dict = field(default_factory=dict)
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
+def load_config(root_override: str | None, editor_override: str | None) -> Cfg:
+    cfg_file = config_home() / APP / "config.toml"
+    data: dict = {}
+    if cfg_file.is_file():
+        try:
+            import tomllib
+
+            data = tomllib.loads(cfg_file.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 - config problems must not brick the tool
+            print(f"{APP}: ignoring bad config {cfg_file}: {exc}", file=sys.stderr)
+
+    root_env = root_override or os.environ.get("NOTE_HOME") or data.get("root")
+    if root_env:
+        root = Path(os.path.expanduser(str(root_env)))
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+        root = Path(xdg) / APP
+
+    editor_cfg = data.get("editor")
+    editor = editor_override or os.environ.get("NOTE_EDITOR") or editor_cfg
+    if not editor:
+        editor = "nvim" if have("nvim") else (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+
+    return Cfg(
+        root=root,
+        notes=root / "notes",
+        trash=root / "trash",
+        tmp=root / ".tmp",
+        db=root / "index.db",
+        editor=shlex.split(str(editor)),
+        fzf_opts=str(data.get("fzf_opts") or DEFAULT_FZF_OPTS),
+        template=str(data.get("template") or ""),
+        limit=int(data.get("limit") or 50),
+        config_file=cfg_file if cfg_file.is_file() else None,
+        config=data,
+    )
+
+
+def ensure_dirs(cfg: Cfg) -> None:
+    for d in (cfg.root, cfg.notes, cfg.trash, cfg.tmp):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------------------------------- front matter
+
+
+def _unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+        if v and v[0] == '"':
+            v = v.replace('\\"', '"').replace("\\\\", "\\")
+    return v
+
+
+def _quote(v: str) -> str:
+    v = str(v)
+    if v == "" or v != v.strip() or any(ch in v for ch in ':#[]{},"\'') or v[0] in "-?*&!|>%@`":
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return v
+
+
+def _as_list(v) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    s = str(v).strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1]
+    return [p.strip() for p in re.split(r"[,\s]+", s) if p.strip()]
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Return (meta, body). Tolerant: plain `k: v`, inline lists, block lists."""
+    text = text.replace("\r\n", "\n")
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return {}, text
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+
+    meta: dict = {}
+    key = None
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_][\w.-]*)\s*:\s*(.*)$", line)
+        if m:
+            key, raw = m.group(1), m.group(2).strip()
+            if raw == "":
+                meta[key] = []
+            elif raw.startswith("[") and raw.endswith("]"):
+                meta[key] = _as_list(raw)
+            else:
+                meta[key] = _unquote(raw)
+        elif line.lstrip().startswith("- ") and key is not None:
+            if not isinstance(meta.get(key), list):
+                meta[key] = _as_list(meta.get(key)) if meta.get(key) else []
+            meta[key].append(_unquote(line.lstrip()[2:]))
+        # anything else: foreign YAML we do not understand, ignored on rewrite
+    body = "\n".join(lines[end + 1 :])
+    if body.startswith("\n"):
+        body = body[1:]
+    return meta, body
+
+
+def dump_frontmatter(meta: dict) -> str:
+    out = ["---"]
+    for k, v in meta.items():
+        if v is None or v == "" or v == []:
+            if k == "tags":
+                out.append("tags: []")
+            elif k == "title":
+                out.append('title: ""')  # keep the field so it can be filled in the editor
+            continue
+        if isinstance(v, list):
+            out.append(f"{k}: [{', '.join(_quote(str(x)) for x in v)}]")
+        else:
+            out.append(f"{k}: {_quote(str(v))}")
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+
+def strip_hashtags(body: str) -> list[str]:
+    return [m.group(1) for m in re.finditer(r"(?<![\w#])#([A-Za-z][\w/\-]*)", body)]
+
+
+def clean_title(text: str) -> str:
+    """Drop inline #tags from a title derived from note content (keeps '#' of a markdown heading)."""
+    return re.sub(r"\s+#[\w/\-]+", " ", text or "").strip()
+
+
+# --------------------------------------------------------------------------- note model
+
+
+@dataclass
+class Note:
+    path: Path
+    uid: str
+    title: str
+    created: str
+    created_ts: float
+    updated: str
+    updated_ts: float
+    tags: list[str]
+    cwd: str
+    host: str
+    git: str
+    session: str
+    source: str
+    body: str
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def snippet(self) -> str:
+        for line in self.body.splitlines():
+            s = line.strip().lstrip("#").lstrip(">*-").strip()
+            if s and not s.startswith("```"):
+                return s[:SNIPPET_LEN]
+        return ""
+
+    def as_json(self, cfg: Cfg | None = None) -> dict:
+        d = {
+            "path": str(self.path),
+            "id": self.uid,
+            "title": self.title,
+            "created": self.created,
+            "updated": self.updated,
+            "tags": self.tags,
+            "cwd": self.cwd,
+            "host": self.host,
+            "git": self.git,
+            "session": self.session,
+            "source": self.source,
+            "body": self.body,
+        }
+        if cfg:
+            d["rel"] = str(self.path.relative_to(cfg.root)) if str(self.path).startswith(str(cfg.root)) else str(self.path)
+        return d
+
+
+def _ts_from_iso(value: str, fallback: float) -> float:
+    if not value:
+        return fallback
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return fallback
+
+
+def read_note(path: Path) -> Note:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    meta, body = parse_frontmatter(raw)
+    st = path.stat()
+    fallback = st.st_mtime
+
+    created = str(meta.get("created") or "")
+    if not created:
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})(\d{2})", path.stem)
+        if m:
+            created = "-".join(m.groups()[:3]) + "T" + ":".join(m.groups()[3:])
+            try:
+                dt = datetime.fromisoformat(created).astimezone()
+                created = iso(dt)
+                fallback = dt.timestamp()
+            except ValueError:
+                created = ""
+        if not created:
+            created = iso(datetime.fromtimestamp(fallback).astimezone())
+    updated = str(meta.get("updated") or created)
+
+    title = str(meta.get("title") or "").strip()
+    if not title:
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("#"):
+                title = s.lstrip("#").strip()
+                break
+            if s:
+                title = clean_title(s[:120])
+                break
+    if not title:
+        title = clean_title(re.sub(r"^\d{4}-\d{2}-\d{2}_\d{6}-?", "", path.stem).replace("-", " ")) or path.stem
+
+    tags = _as_list(meta.get("tags"))
+    for t in strip_hashtags(body):
+        if t not in tags:
+            tags.append(t)
+
+    m = re.search(r"(\d{4})(\d{2})(\d{2})-(\d{6})-([0-9a-f]{4})$", path.stem)
+    uid = str(meta.get("id") or "") or (f"{m.group(1)}{m.group(2)}{m.group(3)}-{m.group(4)}-{m.group(5)}" if m else hashlib.sha1(str(path).encode()).hexdigest()[:12])
+
+    return Note(
+        path=path,
+        uid=uid,
+        title=title,
+        created=created,
+        created_ts=_ts_from_iso(created, fallback),
+        updated=updated,
+        updated_ts=_ts_from_iso(updated, fallback),
+        tags=tags,
+        cwd=str(meta.get("cwd") or ""),
+        host=str(meta.get("host") or ""),
+        git=str(meta.get("git") or ""),
+        session=str(meta.get("session") or ""),
+        source=str(meta.get("source") or ""),
+        body=body,
+        meta=meta,
+    )
+
+
+def write_note(path: Path, meta: dict, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".swp-tmp")
+    tmp.write_text(dump_frontmatter(meta) + "\n" + body.lstrip("\n"), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def final_path(cfg: Cfg, created: datetime, slug: str) -> Path:
+    d = cfg.notes / f"{created:%Y}" / f"{created:%m}"
+    d.mkdir(parents=True, exist_ok=True)
+    base = f"{created:%Y-%m-%d_%H%M%S}"
+    path = d / f"{base}-{slug}.md"
+    n = 2
+    while path.exists():
+        path = d / f"{base}-{slug}-{n}.md"
+        n += 1
+    return path
+
+
+def new_meta(cfg: Cfg, title: str, tags: list[str], source: str) -> tuple[dict, datetime]:
+    now = datetime.now().astimezone().replace(microsecond=0)
+    meta = {
+        "id": f"{now:%Y%m%d-%H%M%S}-{os.urandom(2).hex()}",
+        "title": title,
+        "created": iso(now),
+        "updated": iso(now),
+        "tags": tags,
+        "cwd": str(Path.cwd()),
+        "host": os.uname().nodename,
+    }
+    git = git_context(Path.cwd())
+    if git:
+        meta["git"] = git
+    sess = tmux_context()
+    if sess:
+        meta["session"] = sess
+    meta["source"] = source
+    return meta, now
+
+
+def render_template(cfg: Cfg, title: str, now: datetime) -> str:
+    tpl = cfg.template
+    if not tpl:
+        return ""
+    return (
+        tpl.replace("{title}", title)
+        .replace("{date}", f"{now:%Y-%m-%d}")
+        .replace("{time}", f"{now:%H:%M}")
+        .replace("{datetime}", iso(now))
+    )
+
+
+# --------------------------------------------------------------------------- index
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS notes (
+  id INTEGER PRIMARY KEY,
+  path TEXT UNIQUE NOT NULL,
+  uid TEXT,
+  title TEXT,
+  created TEXT,
+  created_ts REAL,
+  updated TEXT,
+  updated_ts REAL,
+  mtime_ns INTEGER,
+  size INTEGER,
+  tags TEXT,
+  snippet TEXT,
+  cwd TEXT,
+  host TEXT,
+  git TEXT,
+  session TEXT,
+  source TEXT
+);
+CREATE INDEX IF NOT EXISTS notes_created ON notes(created_ts DESC);
+CREATE INDEX IF NOT EXISTS notes_uid ON notes(uid);
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, body, tags, tokenize="unicode61 remove_diacritics 2");
+"""
+
+
+def connect(cfg: Cfg) -> sqlite3.Connection:
+    ensure_dirs(cfg)
+    conn = sqlite3.connect(cfg.db)
+    conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(notes)")}
+    if "snippet" not in cols:  # schema upgrade from an older index
+        conn.execute("ALTER TABLE notes ADD COLUMN snippet TEXT")
+        conn.execute("UPDATE notes SET mtime_ns = NULL")
+        conn.commit()
+    return conn
+
+
+def _row_values(note: Note, st: os.stat_result) -> tuple:
+    return (
+        str(note.path),
+        note.uid,
+        note.title,
+        note.created,
+        note.created_ts,
+        note.updated,
+        note.updated_ts,
+        st.st_mtime_ns,
+        st.st_size,
+        " ".join(t for t in note.tags if t),
+        note.snippet,
+        note.cwd,
+        note.host,
+        note.git,
+        note.session,
+        note.source,
+    )
+
+
+def upsert(conn: sqlite3.Connection, note: Note, st: os.stat_result) -> None:
+    vals = _row_values(note, st)
+    conn.execute(
+        """INSERT INTO notes (path,uid,title,created,created_ts,updated,updated_ts,mtime_ns,size,tags,snippet,cwd,host,git,session,source)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(path) DO UPDATE SET
+             uid=excluded.uid, title=excluded.title, created=excluded.created, created_ts=excluded.created_ts,
+             updated=excluded.updated, updated_ts=excluded.updated_ts, mtime_ns=excluded.mtime_ns,
+             size=excluded.size, tags=excluded.tags, snippet=excluded.snippet, cwd=excluded.cwd, host=excluded.host,
+             git=excluded.git, session=excluded.session, source=excluded.source""",
+        vals,
+    )
+    rowid = conn.execute("SELECT id FROM notes WHERE path=?", (str(note.path),)).fetchone()[0]
+    conn.execute("DELETE FROM notes_fts WHERE rowid=?", (rowid,))
+    conn.execute(
+        "INSERT INTO notes_fts(rowid,title,body,tags) VALUES (?,?,?,?)",
+        (rowid, note.title, note.body, " ".join(note.tags)),
+    )
+
+
+def sync(conn: sqlite3.Connection, cfg: Cfg, paths: list[Path] | None = None) -> int:
+    """Rescan note files; reparse only changed (mtime_ns, size) entries. Returns parsed count."""
+    parsed = 0
+    seen: set[str] = set()
+    if paths is None:
+        files = sorted(cfg.notes.rglob("*.md")) if cfg.notes.is_dir() else []
+    else:
+        files = [p for p in paths if p.exists() and p.suffix == ".md"]
+    for p in files:
+        key = str(p)
+        seen.add(key)
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        row = conn.execute("SELECT mtime_ns, size FROM notes WHERE path=?", (key,)).fetchone()
+        if row and row[0] == st.st_mtime_ns and row[1] == st.st_size:
+            continue
+        try:
+            note = read_note(p)
+        except OSError:
+            continue
+        upsert(conn, note, st)
+        parsed += 1
+    if paths is None:
+        stale = [r[0] for r in conn.execute("SELECT path FROM notes")]
+        for path in stale:
+            if path not in seen:
+                conn.execute("DELETE FROM notes_fts WHERE rowid=(SELECT id FROM notes WHERE path=?)", (path,))
+                conn.execute("DELETE FROM notes WHERE path=?", (path,))
+    conn.commit()
+    return parsed
+
+
+def reindex(conn: sqlite3.Connection, cfg: Cfg) -> int:
+    conn.execute("DELETE FROM notes")
+    conn.execute("DELETE FROM notes_fts")
+    conn.commit()
+    return sync(conn, cfg)
+
+
+def fts_match(query: str) -> str:
+    toks = re.findall(r"\w+", query, re.UNICODE)
+    return " ".join(f'"{t}"*' for t in toks)
+
+
+# newest first; mtime_ns keeps files created within the same second in true creation order
+RECENT_ORDER = "n.created_ts DESC, n.mtime_ns DESC, n.path DESC"
+
+
+def search(
+    conn: sqlite3.Connection,
+    query: str = "",
+    *,
+    tags: list[str] | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    cwd: str | None = None,
+    host: str | None = None,
+    limit: int = 50,
+    order: str = "rank",
+) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    where, params = [], []
+    if since:
+        where.append("n.created_ts >= ?")
+        params.append(since.timestamp())
+    if until:
+        end = (until + timedelta(days=1)) if until.hour == 0 and until.minute == 0 else until
+        where.append("n.created_ts <= ?")
+        params.append(end.timestamp())
+    for t in tags or []:
+        where.append("(' ' || n.tags || ' ') LIKE ?")
+        params.append(f"% {t} %")
+    if cwd:
+        where.append("n.cwd LIKE ?")
+        params.append(f"%{cwd}%")
+    if host:
+        where.append("n.host = ?")
+        params.append(host)
+
+    if query.strip():
+        match = fts_match(query)
+        sql = "SELECT n.* FROM notes n JOIN notes_fts f ON f.rowid = n.id"
+        if match:
+            where.insert(0, "notes_fts MATCH ?")
+            params.insert(0, match)
+        if order == "rank" and match:
+            tail = f"ORDER BY bm25(notes_fts, 8.0, 1.0, 3.0), {RECENT_ORDER} LIMIT {int(limit)}"
+        else:
+            tail = f"ORDER BY {RECENT_ORDER} LIMIT {int(limit)}"
+        rows = conn.execute(" ".join([sql, "WHERE " + " AND ".join(where), tail]), params).fetchall()
+        if rows:
+            return rows
+        if not match:
+            return []
+        # FTS miss (punctuation/substring) -> substring fallback over stored text
+        like = f"%{query.strip()}%"
+        sql2 = (
+            "SELECT n.* FROM notes n JOIN notes_fts f ON f.rowid = n.id WHERE "
+            + " AND ".join(where + ["(f.title LIKE ? OR f.body LIKE ? OR n.tags LIKE ?)"])
+            + f" ORDER BY {RECENT_ORDER} LIMIT ?"
+        )
+        return conn.execute(sql2, params + [like, like, like, int(limit)]).fetchall()
+
+    tail = f"ORDER BY {RECENT_ORDER} LIMIT {int(limit)}"
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    return conn.execute(" ".join(["SELECT n.* FROM notes n", clause, tail]), params).fetchall()
+
+
+def row_to_note(row: sqlite3.Row) -> Note:
+    return Note(
+        path=Path(row["path"]),
+        uid=row["uid"] or "",
+        title=row["title"] or "",
+        created=row["created"] or "",
+        created_ts=row["created_ts"] or 0.0,
+        updated=row["updated"] or "",
+        updated_ts=row["updated_ts"] or 0.0,
+        tags=(row["tags"] or "").split(),
+        cwd=row["cwd"] or "",
+        host=row["host"] or "",
+        git=row["git"] or "",
+        session=row["session"] or "",
+        source=row["source"] or "",
+        body=row["snippet"] or "",
+    )
+
+
+# --------------------------------------------------------------------------- picker
+
+
+def fzf_available(cfg: Cfg) -> bool:
+    return have("fzf") and sys.stdin.isatty() and not os.environ.get("NOTE_NO_FZF")
+
+
+def fzf(lines: list[str], cfg: Cfg, *, prompt: str = "note> ", query: str = "", multi: bool = False,
+        preview: str | None = None, header: str | None = None) -> list[str]:
+    if not fzf_available(cfg):
+        return fallback_pick(lines, prompt, multi)
+    cmd = ["fzf", "--ansi", "--delimiter=\t", "--with-nth=1", f"--prompt={prompt}"]
+    cmd += shlex.split(cfg.fzf_opts)
+    if multi:
+        cmd.append("--multi")
+    if query:
+        cmd += ["--query", query]
+    if header:
+        cmd += ["--header", header]
+    if preview:
+        cmd += ["--preview", preview, "--preview-window=right:60%:wrap"]
+    proc = subprocess.run(cmd, input="\n".join(lines), text=True, stdout=subprocess.PIPE)
+    if proc.returncode != 0:
+        return []
+    return [ln for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def fallback_pick(lines: list[str], prompt: str, multi: bool) -> list[str]:
+    if not lines:
+        return []
+    for i, ln in enumerate(lines, 1):
+        print(f"{i:3d}) {re.sub(chr(27) + r'\[[0-9;]*m', '', ln.split(chr(9))[0])}")
+    hint = "1,3" if multi else "1"
+    try:
+        raw = input(f"{prompt}[{hint}, empty=abort] ").strip()
+    except EOFError:
+        return []
+    if not raw:
+        return []
+    out = []
+    for part in re.split(r"[,\s]+", raw):
+        if part.isdigit() and 1 <= int(part) <= len(lines):
+            out.append(lines[int(part) - 1])
+    return out
+
+
+def preview_cmd() -> str:
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} show --preview -- '{{2}}'"
+
+
+def display_line(n: Note, now: datetime, color: bool) -> str:
+    age = fmt_age(n.created_ts, now)
+    date = datetime.fromtimestamp(n.created_ts).astimezone().strftime("%Y-%m-%d %H:%M") if n.created_ts else "?"
+    tags = " ".join(f"#{t}" for t in n.tags[:4])
+    title = n.title[:52]
+    return (
+        f"{c(date, C_DATE, color)} {c(age.rjust(4), C_DIM, color)}  "
+        f"{c(title.ljust(52), C_TITLE, color)} "
+        f"{c(tags.ljust(24), C_TAG, color)} {c(n.snippet, C_SNIP, color)}"
+    )
+
+
+# --------------------------------------------------------------------------- resolve
+
+
+def iter_rows(conn: sqlite3.Connection):
+    conn.row_factory = sqlite3.Row
+    return conn.execute("SELECT * FROM notes ORDER BY created_ts DESC").fetchall()
+
+
+def resolve(conn: sqlite3.Connection, cfg: Cfg, ref: str) -> Path | None:
+    """Resolve a reference: path, basename/prefix glob, uid, timestamp fragment, or a fuzzy query."""
+    if not ref:
+        return None
+    ref = ref.strip()
+    cand = Path(os.path.expanduser(ref))
+    if cand.is_file() and cand.suffix == ".md":
+        return cand
+    relative = cfg.notes / ref
+    if relative.is_file():
+        return relative
+
+    name = Path(ref).name
+    if name.endswith(".md"):
+        name = name[:-3]
+    rows = iter_rows(conn)
+    for r in rows:
+        p = Path(r["path"])
+        if r["uid"] == ref or p.stem == name:
+            return p
+    # prefix / substring on filename stem, newest first
+    needle = name.lower()
+    hits: list[Path] = []
+    for r in rows:
+        stem = Path(r["path"]).stem.lower()
+        if stem.endswith(needle) or stem.startswith(needle) or needle in stem:
+            hits.append(Path(r["path"]))
+    if hits:
+        hits.sort(key=lambda p: p.stem, reverse=True)
+        return hits[0]
+    # title substring
+    for r in rows:
+        if needle in (r["title"] or "").lower():
+            return Path(r["path"])
+    # last resort: fts query with picker
+    qrows = search(conn, ref, limit=50)
+    if not qrows:
+        return None
+    now = datetime.now().astimezone()
+    color = use_color()
+    lines = [f"{display_line(row_to_note(r), now, color)}\t{r['path']}" for r in qrows]
+    sel = fzf(lines, cfg, prompt=f"{ref}> ", preview=preview_cmd(), header="enter: open  esc: cancel")
+    if not sel:
+        return None
+    return Path(sel[0].split("\t")[-1])
+
+
+def latest_path(conn: sqlite3.Connection) -> Path | None:
+    row = conn.execute(f"SELECT path FROM notes n ORDER BY {RECENT_ORDER} LIMIT 1").fetchone()
+    return Path(row[0]) if row else None
+
+
+# --------------------------------------------------------------------------- editor
+
+
+def open_in_editor(cfg: Cfg, path: Path) -> int:
+    ensure_dirs(cfg)
+    args = list(cfg.editor) or ["vi"]
+    cmd = [*args, str(path)]
+    if Path(args[0]).name in ("nvim", "vim", "vi", "neovim", "nvim-qt"):
+        cmd = [*args, "+", str(path)]
+    try:
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        die(f"editor not found: {args[0]}")
+        return 127
+
+
+def touch_updated(cfg: Cfg, path: Path, before_hash: str) -> None:
+    """Bump frontmatter `updated` when an edited note's content actually changed."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if hashlib.sha1(raw.encode()).hexdigest() == before_hash:
+        return
+    meta, body = parse_frontmatter(raw)
+    if "updated" not in meta and not meta:
+        return
+    meta["updated"] = iso(datetime.now().astimezone())
+    write_note(path, meta, body)
+
+
+def file_hash(path: Path) -> str:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def cmd_new(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    title = " ".join(args.words).strip()
+    tags = collect_tags(args.tag)
+    meta, now = new_meta(cfg, title, tags, "editor" if not args.no_editor else "cli")
+    ensure_dirs(cfg)
+
+    if args.no_editor:
+        body = sys.stdin.read() if not sys.stdin.isatty() else ""
+        if title and body:
+            body = f"# {title}\n\n{body}"
+        elif title:
+            body = f"# {title}\n"
+        slug = slugify(title or body[:60])
+        path = final_path(cfg, now, slug)
+        write_note(path, meta, body)
+        sync(conn, cfg, [path])
+        emit_note(path, args, cfg)
+        return 0
+
+    draft = cfg.tmp / f"{meta['id']}.md"
+    body = render_template(cfg, title, now)
+    if title:
+        body = f"# {title}\n\n{body}" if body else f"# {title}\n"
+    write_note(draft, meta, body)
+    rc = open_in_editor(cfg, draft)
+    if rc != 0:
+        print(f"{APP}: editor exited {rc}", file=sys.stderr)
+    if not draft.exists():
+        print(f"{APP}: draft vanished, nothing saved", file=sys.stderr)
+        return rc or 1
+    raw = draft.read_text(encoding="utf-8", errors="replace")
+    dmeta, dbody = parse_frontmatter(raw)
+    if not dbody.strip():
+        draft.unlink()
+        print(f"{APP}: empty note discarded", file=sys.stderr)
+        return rc
+
+    merged = dict(meta)
+    merged.update({k: v for k, v in dmeta.items() if v not in (None, "")})
+    final_title = str(merged.get("title") or "").strip() or first_line_title(dbody) or "untitled"
+    merged["title"] = final_title
+    merged["created"] = meta["created"]
+    merged["updated"] = iso(datetime.now().astimezone())
+    merged["tags"] = dedup(list(_as_list(merged.get("tags"))) + strip_hashtags(dbody))
+    slug = slugify(final_title)
+    target = final_path(cfg, now, slug)
+    write_note(target, merged, dbody)
+    draft.unlink()
+    sync(conn, cfg, [target])
+    print(f"{APP}: saved {target.relative_to(cfg.root)}")
+    return 0
+
+
+def first_line_title(body: str) -> str:
+    for line in body.splitlines():
+        s = line.strip().lstrip("#").strip()
+        if s:
+            return clean_title(s[:120])
+    return ""
+
+
+def dedup(items: list[str]) -> list[str]:
+    out, seen = [], set()
+    for i in items:
+        if i and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def collect_tags(values) -> list[str]:
+    out: list[str] = []
+    for v in values or []:
+        out += [t.strip().lstrip("#") for t in re.split(r"[,\s]+", v) if t.strip()]
+    return dedup(out)
+
+
+def capture(cfg: Cfg, conn: sqlite3.Connection, text: str, tags: list[str], source: str) -> Path:
+    text = text.strip("\n")
+    lines = text.splitlines()
+    title = clean_title(lines[0].strip().lstrip("#").strip()[:120]) if lines else ""
+    body = "\n".join(lines[1:]).strip("\n")
+    if body:
+        body += "\n"
+    tags = dedup(list(tags) + strip_hashtags(text))
+    meta, now = new_meta(cfg, title, tags, source)
+    path = final_path(cfg, now, slugify(title or text))
+    write_note(path, meta, body)
+    sync(conn, cfg, [path])
+    return path
+
+
+def cmd_add(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    text = " ".join(args.words).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read()
+    if not text.strip():
+        die("nothing to add (give text or pipe it in)")
+    path = capture(cfg, conn, text, collect_tags(args.tag), "cli")
+    emit_note(path, args, cfg)
+    return 0
+
+
+def cmd_append(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    text = " ".join(args.words).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read()
+    if not text.strip():
+        die("nothing to append (give text or pipe it in)")
+    target = resolve(conn, cfg, args.to) if args.to else latest_path(conn)
+    if not target:
+        if args.to:
+            die(f"no note matching {args.to!r}")
+        die("no notes yet - run 'note' first")
+    body_add = text.rstrip("\n")
+    if args.bullet and body_add.count("\n") == 0:
+        body_add = f"- {datetime.now().astimezone():%H:%M} {body_add}"
+    raw = target.read_text(encoding="utf-8", errors="replace")
+    meta, body = parse_frontmatter(raw)
+    body = body.rstrip("\n")
+    body = f"{body}\n\n{body_add}\n" if body else f"{body_add}\n"
+    meta["updated"] = iso(datetime.now().astimezone())
+    tags = dedup(_as_list(meta.get("tags")) + collect_tags(args.tag) + strip_hashtags(body_add))
+    if tags:
+        meta["tags"] = tags
+    write_note(target, meta, body)
+    sync(conn, cfg, [target])
+    if not args.quiet:
+        print(f"{APP}: appended to {target.name}")
+    return 0
+
+
+def emit_note(path: Path, args, cfg: Cfg) -> None:
+    if getattr(args, "json", False):
+        print(json.dumps(read_note(path).as_json(cfg), indent=2))
+    elif getattr(args, "quiet", False):
+        print(path)
+    else:
+        print(f"{APP}: saved {path.relative_to(cfg.root) if str(path).startswith(str(cfg.root)) else path}")
+
+
+def rows_to_lines(rows, now: datetime, color: bool) -> tuple[list[str], list[Note]]:
+    notes = [row_to_note(r) for r in rows]
+    lines = [f"{display_line(n, now, color)}\t{n.path}" for n in notes]
+    return lines, notes
+
+
+def pick_and_open(args, cfg: Cfg, conn: sqlite3.Connection, rows, prompt: str, query: str = "") -> int:
+    now = datetime.now().astimezone()
+    lines, notes = rows_to_lines(rows, now, use_color())
+    if not lines:
+        if args.json:
+            print("[]")
+        else:
+            print(f"{APP}: no notes found", file=sys.stderr)
+        return 1
+    print_path = getattr(args, "print_path", False)
+    if not sys.stdin.isatty() or print_path or args.json:
+        if args.json:
+            print(json.dumps([n.as_json(cfg) for n in notes], indent=2))
+        else:
+            for n in notes:
+                line = display_line(n, now, use_color())
+                print(f"{line.rstrip()}  {n.path}" if print_path else line.rstrip())
+        return 0
+    sel = fzf(lines, cfg, prompt=prompt, query=query, multi=args.multi if hasattr(args, "multi") else False,
+              preview=preview_cmd(), header="enter: open  tab: multi  esc: cancel")
+    if not sel:
+        return 0
+    paths = [Path(s.split("\t")[-1]) for s in sel]
+    if getattr(args, "paths_only", False):
+        for p in paths:
+            print(p)
+        return 0
+    return open_paths(cfg, conn, paths)
+
+
+def open_paths(cfg: Cfg, conn: sqlite3.Connection, paths: list[Path]) -> int:
+    live: list[Path] = []
+    for p in paths:
+        if not p.exists():
+            print(f"{APP}: missing {p}", file=sys.stderr)
+            continue
+        live.append(p)
+    if not live:
+        return 1
+    before = {p: file_hash(p) for p in live}
+    if len(live) == 1:
+        rc = open_in_editor(cfg, live[0])
+    else:  # one editor session with every selected note as a buffer
+        args = list(cfg.editor) or ["vi"]
+        try:
+            rc = subprocess.call([*args, *[str(p) for p in live]])
+        except FileNotFoundError:
+            die(f"editor not found: {args[0]}")
+            return 127
+    for p in live:
+        touch_updated(cfg, p, before[p])
+        sync(conn, cfg, [p])
+    return rc
+
+
+def cmd_ls(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    tags = collect_tags(args.tag)
+    since = parse_when(args.since) if args.since else None
+    rows = search(conn, args.query or "", tags=tags, since=since, limit=args.number or cfg.limit)
+    return pick_and_open(args, cfg, conn, rows, prompt="notes> ", query="")
+
+
+def cmd_find(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    query = " ".join(args.words).strip()
+    if args.regex:
+        return regex_search(args, cfg, conn, query)
+    tags = collect_tags(args.tag)
+    if not query and not (tags or args.since or args.until or args.cwd or args.host):
+        die("give a search query (or filter with --tag/--since/--until/--cwd/--host)")
+    rows = search(
+        conn,
+        query,
+        tags=tags,
+        since=parse_when(args.since) if args.since else None,
+        until=parse_when(args.until) if args.until else None,
+        cwd=args.cwd,
+        host=args.host,
+        limit=args.number or cfg.limit,
+        order="date" if args.sort == "date" else "rank",
+    )
+    return pick_and_open(args, cfg, conn, rows, prompt=f"/{query}> ")
+
+
+def regex_search(args, cfg: Cfg, conn: sqlite3.Connection, query: str) -> int:
+    if not query:
+        die("give a regex")
+    if have("rg"):
+        cmd = ["rg", "--json", "--smart-case", "--max-count", "40", "-e", query, str(cfg.notes)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        hits: dict[str, list[tuple[int, str]]] = {}
+        for line in proc.stdout.splitlines():
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") != "match":
+                continue
+            d = ev["data"]
+            path = d["path"]["text"]
+            hits.setdefault(path, []).append((d["line_number"], d["lines"]["text"].rstrip("\n")))
+        now = datetime.now().astimezone()
+        color = use_color()
+        lines, notes = [], []
+        for path, found in hits.items():
+            n = read_note(Path(path))
+            notes.append(n)
+            snippet = " | ".join(f"{ln}:{txt.strip()[:60]}" for ln, txt in found[:3])
+            lines.append(f"{display_line(n, now, color)} {c(snippet, C_SNIP, color)}\t{n.path}")
+        if args.json:
+            print(json.dumps([n.as_json(cfg) for n in notes], indent=2))
+            return 0
+        if not lines:
+            if args.json:
+                print("[]")
+            else:
+                print(f"{APP}: no matches", file=sys.stderr)
+            return 1
+        if not sys.stdin.isatty():
+            for ln in lines:
+                print(ln.split("\t")[0])
+            return 0
+        sel = fzf(lines, cfg, prompt=f"/{query}/ ", preview=preview_cmd(), header="enter: open")
+        return open_paths(cfg, conn, [Path(s.split("\t")[-1]) for s in sel]) if sel else 0
+    # no rg: fall back to index substring search
+    rows = search(conn, query, limit=args.number or cfg.limit)
+    return pick_and_open(args, cfg, conn, rows, prompt=f"/{query}/ ")
+
+
+def cmd_show(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    targets = [Path(p) for p in args.paths]
+    if not targets:
+        ref = " ".join(args.ref).strip()
+        if not ref:
+            die("usage: note show <id|path|query>")
+        path = resolve(conn, cfg, ref)
+        if not path:
+            die(f"no note matching {ref!r}")
+        targets = [path]
+    out = []
+    for p in targets:
+        if not p.exists():
+            die(f"no such note: {p}")
+        n = read_note(p)
+        out.append(n)
+        if args.json:
+            continue
+        if args.preview:
+            color = use_color()
+            meta_bits = [
+                c(n.created, C_DATE, color),
+                c(" ".join(f"#{t}" for t in n.tags), C_TAG, color),
+                c(n.git or "", C_DIM, color),
+                c(n.session or "", C_DIM, color),
+            ]
+            print(f"{c(n.title, C_TITLE, color)}  {'  '.join(b for b in meta_bits if b.strip())}")
+            if n.cwd:
+                print(c(n.cwd, C_DIM, color))
+            print(c("-" * 60, C_DIM, color))
+            print(n.body.rstrip("\n"))
+        elif args.raw or len(targets) > 1:
+            print(f"# {p}" if len(targets) > 1 else "", end="")
+            print(p.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
+        else:
+            print(p.read_text(encoding="utf-8", errors="replace").rstrip("\n"))
+    if args.json:
+        print(json.dumps([n.as_json(cfg) for n in out], indent=2))
+    return 0
+
+
+def cmd_open(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    ref = " ".join(args.ref).strip()
+    if not ref or args.pick:
+        rows = search(conn, ref, limit=args.number or cfg.limit)
+        return pick_and_open(args, cfg, conn, rows, prompt="open> ", query=ref)
+    path = resolve(conn, cfg, ref)
+    if not path:
+        die(f"no note matching {ref!r}")
+    return open_paths(cfg, conn, [path])
+
+
+def cmd_last(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    rows = search(conn, "", limit=args.number or 1)
+    if not rows:
+        die("no notes yet")
+    if args.show:
+        args.paths = [r["path"] for r in rows]
+        args.ref = []
+        args.json = getattr(args, "json", False)
+        args.preview = False
+        args.raw = True
+        return cmd_show(args, cfg, conn)
+    return open_paths(cfg, conn, [Path(r["path"]) for r in rows])
+
+
+def cmd_rm(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    query = " ".join(args.words).strip()
+    rows = search(conn, query, tags=collect_tags(args.tag), limit=args.number or cfg.limit)
+    if not rows:
+        print(f"{APP}: no notes found", file=sys.stderr)
+        return 1
+    now = datetime.now().astimezone()
+    lines, notes = rows_to_lines(rows, now, use_color())
+    if args.all:
+        chosen = notes
+    elif sys.stdin.isatty():
+        sel = fzf(lines, cfg, prompt="delete> ", multi=True, preview=preview_cmd(),
+                  header="tab: select  enter: confirm  esc: cancel")
+        if not sel:
+            return 0
+        chosen = [read_note(Path(s.split("\t")[-1])) for s in sel]
+    else:
+        chosen = notes
+        if not args.yes:
+            die("refusing to delete without --yes when stdin is not a tty")
+
+    if not args.yes:
+        print(f"{APP}: about to delete {len(chosen)} note(s):")
+        for n in chosen:
+            print(f"  {n.path.relative_to(cfg.root)}  {c(n.title, C_TITLE, use_color())}")
+        try:
+            ans = input(f"delete? [y/N] ").strip().lower()
+        except EOFError:
+            ans = "n"
+        if ans not in ("y", "yes"):
+            print(f"{APP}: aborted", file=sys.stderr)
+            return 1
+
+    stamp = f"{now:%Y-%m-%d_%H%M%S}"
+    for n in chosen:
+        if args.purge:
+            n.path.unlink(missing_ok=True)
+        else:
+            dest = cfg.trash / stamp / n.path.relative_to(cfg.notes)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(n.path), str(dest))
+            (dest.parent / (dest.name + ".meta")).write_text(json.dumps({"original": str(n.path)}), encoding="utf-8")
+        conn.execute("DELETE FROM notes_fts WHERE rowid=(SELECT id FROM notes WHERE path=?)", (str(n.path),))
+        conn.execute("DELETE FROM notes WHERE path=?", (str(n.path),))
+        print(f"{APP}: deleted {n.path.relative_to(cfg.root)}")
+    conn.commit()
+    if not args.purge:
+        print(f"{APP}: recoverable via 'note restore' (trash {stamp})")
+    return 0
+
+
+def cmd_restore(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    if not cfg.trash.is_dir():
+        die("trash is empty")
+    entries: list[tuple[Path, Path]] = []
+    for meta_file in sorted(cfg.trash.rglob("*.md.meta"), reverse=True):
+        try:
+            original = Path(json.loads(meta_file.read_text())["original"])
+        except Exception:  # noqa: BLE001
+            continue
+        note_file = meta_file.with_name(meta_file.name[: -len(".meta")])
+        if note_file.exists():
+            entries.append((note_file, original))
+    if not entries:
+        die("trash is empty")
+    now = datetime.now().astimezone()
+    lines = []
+    for note_file, original in entries:
+        n = read_note(note_file)
+        lines.append(f"{display_line(n, now, use_color())} {c(str(original), C_DIM, use_color())}\t{note_file}|{original}")
+    if len(entries) == 1 or not sys.stdin.isatty():
+        chosen = [lines[0]] if not args.all else lines
+    else:
+        chosen = fzf(lines, cfg, prompt="restore> ", multi=True, preview=preview_cmd(), header="tab: select  enter: restore")
+        if not chosen:
+            return 0
+    for ln in chosen:
+        note_file, original = ln.split("\t")[-1].split("|", 1)
+        src, dst = Path(note_file), Path(original)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst = dst.with_name(f"{dst.stem}-restored{dst.suffix}")
+        shutil.move(str(src), str(dst))
+        Path(str(src) + ".meta").unlink(missing_ok=True)
+        sync(conn, cfg, [dst])
+        print(f"{APP}: restored {dst}")
+    return 0
+
+
+def cmd_tags(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    counts: dict[str, int] = {}
+    for r in conn.execute("SELECT tags FROM notes"):
+        for t in (r[0] or "").split():
+            counts[t] = counts.get(t, 0) + 1
+    if args.json:
+        print(json.dumps(counts, indent=2))
+        return 0
+    if not counts:
+        print(f"{APP}: no tags yet", file=sys.stderr)
+        return 1
+    color = use_color()
+    for tag, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"{c(str(n).rjust(4), C_DIM, color)}  {c('#' + tag, C_TAG, color)}")
+    return 0
+
+
+def cmd_tag(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    tag = args.name.lstrip("#")
+    args.tag = [tag]
+    args.query = ""
+    args.since = None
+    rows = search(conn, "", tags=[tag], limit=args.number or cfg.limit)
+    if not rows:
+        die(f"no notes tagged #{tag}")
+    return pick_and_open(args, cfg, conn, rows, prompt=f"#{tag}> ")
+
+
+def cmd_reindex(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    before = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    n = reindex(conn, cfg)
+    after = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    print(f"{APP}: reindexed {after} note(s) ({n} parsed, {before} replaced) -> {cfg.db}")
+    return 0
+
+
+def cmd_gc(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    if not cfg.trash.is_dir():
+        print(f"{APP}: trash empty", file=sys.stderr)
+        return 0
+    cutoff = datetime.now().timestamp() - (args.days * 86400)
+    purged = 0
+    for bucket in sorted(cfg.trash.iterdir()):
+        if not bucket.is_dir():
+            continue
+        try:
+            ts = datetime.strptime(bucket.name, "%Y-%m-%d_%H%M%S").timestamp()
+        except ValueError:
+            ts = bucket.stat().st_mtime
+        if args.all or ts < cutoff:
+            purged += sum(1 for _ in bucket.rglob("*") if _.is_file())
+            shutil.rmtree(bucket)
+    if cfg.trash.exists():
+        for leftover in list(cfg.trash.iterdir()):
+            if leftover.is_file():
+                leftover.unlink()
+    print(f"{APP}: purged {purged} file(s) from trash (older than {args.days}d)")
+    return 0
+
+
+def cmd_where(args, cfg: Cfg, conn: sqlite3.Connection) -> int:
+    sync(conn, cfg)
+    total = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    newest = conn.execute("SELECT created FROM notes ORDER BY created_ts DESC LIMIT 1").fetchone()
+    info = {
+        "version": VERSION,
+        "root": str(cfg.root),
+        "notes": str(cfg.notes),
+        "trash": str(cfg.trash),
+        "index": str(cfg.db),
+        "config": str(cfg.config_file) if cfg.config_file else "(none)",
+        "editor": " ".join(cfg.editor),
+        "fzf": "yes" if have("fzf") else "no",
+        "rg": "yes" if have("rg") else "no",
+        "notes_count": total,
+        "newest": newest[0] if newest else None,
+        "db_bytes": cfg.db.stat().st_size if cfg.db.exists() else 0,
+        "env": {k: v for k, v in os.environ.items() if k.startswith("NOTE_")},
+    }
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+    color = use_color()
+    for key in ("version", "root", "notes", "trash", "index", "config", "editor", "fzf", "rg", "notes_count", "newest", "db_bytes"):
+        print(f"{c(key.rjust(11), C_DIM, color)}: {info[key]}")
+    return 0
+
+
+# --------------------------------------------------------------------------- cli
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP,
+        description="Capture notes into nvim fast; dated, timestamped, indexed, searchable.",
+        epilog="run 'note' with no arguments to start a new note.",
+    )
+    p.add_argument("-V", "--version", action="version", version=f"{APP} {VERSION}")
+    p.add_argument("--root", help="override notes root (default: $NOTE_HOME or ~/.local/share/note)")
+    p.add_argument("--editor", help="override editor command")
+    p.add_argument("--json", action="store_true", help="machine readable output")
+    p.add_argument("-q", "--quiet", action="store_true", help="suppress chatter, print paths only")
+    # same flags again on every subcommand so they work after the command word too;
+    # SUPPRESS keeps the top-level values when only the global form is used
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--root", help=argparse.SUPPRESS)
+    common.add_argument("--editor", help=argparse.SUPPRESS)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    common.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sub = p.add_subparsers(dest="cmd")
+
+    def add(name, *aliases, help_="", **kw):
+        s = sub.add_parser(name, aliases=list(aliases), help=help_, description=help_ or None,
+                           parents=[common], **kw)
+        return s
+
+    s = add("new", "n", help_="open the editor on a new note (default)")
+    s.add_argument("words", nargs="*", help="note title")
+    s.add_argument("-t", "--tag", action="append", default=[], help="tag (repeatable, comma separated)")
+    s.add_argument("--no-editor", action="store_true", help="create from title + stdin without opening the editor")
+    s.set_defaults(func=cmd_new)
+
+    s = add("add", "a", "q", help_="capture a note without opening the editor")
+    s.add_argument("words", nargs="*", help="note text (or pipe via stdin)")
+    s.add_argument("-t", "--tag", action="append", default=[], help="tag (repeatable)")
+    s.set_defaults(func=cmd_add)
+
+    s = add("append", "ap", help_="append text to the latest note (or --to REF)")
+    s.add_argument("words", nargs="*", help="text (or pipe via stdin)")
+    s.add_argument("--to", help="append to this note instead of the latest")
+    s.add_argument("--bullet", action="store_true", help="prefix a single-line entry with '- HH:MM'")
+    s.add_argument("-t", "--tag", action="append", default=[], help="add tag if missing")
+    s.set_defaults(func=cmd_append)
+
+    s = add("ls", "list", "l", help_="list notes (fuzzy picker) and open the selection")
+    s.add_argument("query", nargs="?", default="", help="initial search query")
+    s.add_argument("-n", "--number", type=int, help="max entries")
+    s.add_argument("-t", "--tag", action="append", default=[], help="filter by tag")
+    s.add_argument("--since", help="only notes since (today, yesterday, -7d, 2026-10-01)")
+    s.add_argument("-p", "--print-path", action="store_true", help="print paths instead of opening")
+    s.set_defaults(func=cmd_ls)
+
+    s = add("find", "f", "search", "s", help_="full-text search the index, pick a hit, open it")
+    s.add_argument("words", nargs="*", help="query terms")
+    s.add_argument("-t", "--tag", action="append", default=[], help="filter by tag")
+    s.add_argument("--since", help="lower bound")
+    s.add_argument("--until", help="upper bound")
+    s.add_argument("--cwd", help="only notes captured under this directory (substring)")
+    s.add_argument("--host", help="only notes captured on this host")
+    s.add_argument("-e", "--regex", action="store_true", help="regex search with ripgrep instead of FTS")
+    s.add_argument("-n", "--number", type=int, help="max results")
+    s.add_argument("--sort", choices=("rank", "date"), default="rank")
+    s.add_argument("-p", "--print-path", action="store_true", help="print paths instead of opening")
+    s.set_defaults(func=cmd_find)
+
+    s = add("show", "cat", help_="print a note")
+    s.add_argument("ref", nargs="*", help="id, filename fragment, path or query")
+    s.add_argument("--paths", dest="paths", nargs="*", default=[], help=argparse.SUPPRESS)
+    s.add_argument("--raw", action="store_true", help="raw file contents (default)")
+    s.add_argument("--preview", action="store_true", help="colored preview with metadata header")
+    s.set_defaults(func=cmd_show)
+
+    s = add("open", "edit", "e", help_="open a note in the editor")
+    s.add_argument("ref", nargs="*", help="id, filename fragment or query")
+    s.add_argument("--pick", action="store_true", help="always show the picker")
+    s.add_argument("-n", "--number", type=int, help="max picker entries")
+    s.set_defaults(func=cmd_open)
+
+    s = add("last", help_="open (or --show) the most recent note")
+    s.add_argument("--show", action="store_true", help="print instead of opening")
+    s.add_argument("-n", "--number", type=int, default=1, help="how many of the latest")
+    s.set_defaults(func=cmd_last)
+
+    s = add("rm", "delete", "d", help_="pick notes and move them to trash")
+    s.add_argument("words", nargs="*", help="pre-filter query")
+    s.add_argument("-t", "--tag", action="append", default=[], help="filter by tag")
+    s.add_argument("-n", "--number", type=int, help="max candidates")
+    s.add_argument("-a", "--all", action="store_true", help="delete every match (no picker)")
+    s.add_argument("-y", "--yes", action="store_true", help="skip confirmation")
+    s.add_argument("--purge", action="store_true", help="delete permanently instead of trashing")
+    s.set_defaults(func=cmd_rm)
+
+    s = add("restore", "undo", help_="restore notes from trash")
+    s.add_argument("-a", "--all", action="store_true", help="restore everything")
+    s.set_defaults(func=cmd_restore)
+
+    s = add("tags", "t", help_="list tags with counts")
+    s.set_defaults(func=cmd_tags)
+
+    s = add("tag", help_="list notes with a tag")
+    s.add_argument("name", help="tag name")
+    s.add_argument("-n", "--number", type=int, help="max entries")
+    s.add_argument("-p", "--print-path", action="store_true", help="print paths instead of opening")
+    s.set_defaults(func=cmd_tag)
+
+    s = add("reindex", help_="rebuild the search index from files")
+    s.set_defaults(func=cmd_reindex)
+
+    s = add("gc", help_="purge the trash")
+    s.add_argument("-d", "--days", type=int, default=30, help="keep newer than N days (default 30)")
+    s.add_argument("-a", "--all", action="store_true", help="purge everything")
+    s.set_defaults(func=cmd_gc)
+
+    s = add("where", "info", help_="show paths, editor and index stats")
+    s.set_defaults(func=cmd_where)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        args = parser.parse_args(["new", *argv])
+    cfg = load_config(args.root, args.editor)
+    ensure_dirs(cfg)
+    conn = connect(cfg)
+    try:
+        return args.func(args, cfg, conn)
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        return 130
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
