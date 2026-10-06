@@ -92,6 +92,11 @@ The entire tool is the single executable file `note`. See
 [development.md](project_docs/simple_note/development.md) for the test strategy and the release
 checklist.
 
+## License
+
+[MIT](LICENSE) — the copyright holder is listed as `uzuw`; change that line if you want your legal
+name there instead.
+
 ## Known limitations
 
 - Linux/POSIX only; not exercised on macOS or Windows.
