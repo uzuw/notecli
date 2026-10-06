@@ -587,3 +587,37 @@ def test_regex_search_falls_back_to_index_without_ripgrep(env, tmp_path):
     assert r.returncode == 0, r.stderr
     assert [n["title"] for n in json.loads(r.stdout)] == ["Kafka rebalance storm"]
 
+
+
+# --------------------------------------------------------------------------- help
+
+
+def test_help_command_lists_commands_without_touching_data(env, tmp_path):
+    r = run(env, "help")
+    assert r.returncode == 0
+    assert "usage: note" in r.stdout and "recover" in r.stdout and "note help" in r.stdout
+    assert not (tmp_path / "data").exists(), "help must not create a notes root"
+    assert run(env, "--help").stdout == r.stdout, "note help and note --help agree"
+
+
+def test_help_for_one_command_including_aliases(env):
+    for topic in ("find", "f", "ls", "rm", "recover", "gc"):
+        r = run(env, "help", topic)
+        assert r.returncode == 0 and r.stdout.startswith("usage: note"), (topic, r.stdout[:80])
+    assert "--since" in run(env, "help", "find").stdout
+    assert "--purge" in run(env, "help", "rm").stdout
+    assert run(env, "help", "find").stdout == run(env, "find", "--help").stdout
+
+
+def test_help_does_not_become_a_note(env, tmp_path):
+    """'note help' used to open the editor on a note titled 'help' (bare-title fallback)."""
+    log = tmp_path / "editor.log"
+    r = run(env, "help", extra_env={"EDITOR_LOG": str(log), "FAKE_BODY": "should never happen"})
+    assert r.returncode == 0 and "usage: note" in r.stdout
+    assert not log.exists() and notes_of(env, tmp_path) == []
+
+
+def test_help_rejects_unknown_topic(env):
+    r = run(env, "help", "nonsense")
+    assert r.returncode == 1 and "no such command: nonsense" in r.stderr
+    assert "usage: note" in r.stdout

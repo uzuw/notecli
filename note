@@ -30,7 +30,7 @@ VERSION = "0.1.1"
 COMMANDS = (
     "new", "n", "add", "a", "q", "append", "ap", "ls", "list", "l", "find", "f", "search", "s",
     "show", "cat", "open", "edit", "e", "last", "rm", "delete", "d", "restore", "undo", "recover",
-    "tags", "t", "tag", "reindex", "gc", "where", "info",
+    "tags", "t", "tag", "reindex", "gc", "where", "info", "help",
 )
 DEFAULT_FZF_OPTS = "--height=90% --layout=reverse --border --info=inline"
 SNIPPET_LEN = 72
@@ -1456,7 +1456,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=APP,
         description="Capture notes into nvim fast; dated, timestamped, indexed, searchable.",
-        epilog="run 'note' with no arguments to start a new note.",
+        epilog="run 'note' with no arguments to start a new note; 'note help' or "
+               "'note help <command>' lists the commands and their options.",
     )
     p.add_argument("-V", "--version", action="version", version=f"{APP} {VERSION}")
     p.add_argument("--root", help="override notes root (default: $NOTE_HOME or ~/.local/share/note)")
@@ -1570,7 +1571,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = add("where", "info", help_="show paths, editor and index stats")
     s.set_defaults(func=cmd_where)
+
+    s = add("help", help_="show help for the CLI or for one command")
+    s.add_argument("topic", nargs="?", help="command to describe (alias accepted)")
     return p
+
+
+def cmd_help(parser: argparse.ArgumentParser, topic: str | None) -> int:
+    """`note help` / `note help <command>`, so help is reachable without knowing about flags."""
+    if topic:
+        subparsers = next((a for a in parser._actions if isinstance(a, argparse._SubParsersAction)), None)
+        target = subparsers.choices.get(topic) if subparsers else None
+        if target is None:
+            print(f"{APP}: no such command: {topic}", file=sys.stderr)
+            parser.print_help()
+            return 1
+        target.print_help()
+        return 0
+    parser.print_help()
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1581,6 +1600,8 @@ def main(argv: list[str] | None = None) -> int:
     if argv and not argv[0].startswith("-") and argv[0] not in COMMANDS:
         argv = ["new", *argv]
     args = parser.parse_args(argv)
+    if getattr(args, "cmd", None) == "help":  # no config, no index, no data dirs for a help request
+        return cmd_help(parser, args.topic)
     if not getattr(args, "cmd", None):
         args = parser.parse_args(["new", *argv])
     cfg = load_config(args.root, args.editor)
