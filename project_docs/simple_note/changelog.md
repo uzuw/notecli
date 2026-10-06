@@ -5,7 +5,12 @@ All notable changes to `note`. Versions follow `MAJOR.MINOR.PATCH`; the version 
 
 ## Unreleased
 
-_Nothing yet._
+### Added
+
+- `note help [command]` — the help text reachable as a command instead of only as a flag:
+  `note help` lists every command with its aliases, `note help rm` describes one command (aliases
+  accepted), `note help whatever` prints the list and exits `1`. It short-circuits before config and
+  index loading, so it creates no data directory and opens no editor.
 
 ## 0.1.1 — 2026-10-06
 

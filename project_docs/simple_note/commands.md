@@ -41,6 +41,7 @@ Accepted both before and after the command word (`note --json ls` ≡ `note ls -
 | `-q`, `--quiet` | Suppress chatter; `add`/`new` print only the path |
 | `-V`, `--version` | Print `note <version>` |
 | `-h`, `--help` | Help for the CLI or a single command (`note find -h`) |
+| `note help [command]` | Same text, spelled as a command: `note help` lists everything, `note help find` describes one command (aliases work: `note help f`). Nothing is created, indexed or opened. |
 
 ## Exit codes
 

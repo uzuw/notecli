@@ -42,6 +42,7 @@ release](https://github.com/uzuw/notecli/releases); download it, `chmod +x`, put
 | `note recover` | File drafts left behind by a killed run (`where` counts them). |
 | `note tags` / `note tag <name>` | Tag counts / notes carrying a tag. |
 | `note reindex`, `note gc`, `note where` | Rebuild the index, purge trash, show paths and stats. |
+| `note help [command]` | List the commands, or describe one (`note help rm`). |
 
 Filters: `ls` takes `-t/--tag` and `--since`; `find` takes `-t/--tag`, `--since`, `--until`, `--cwd`,
 `--host`; `rm` takes `-t/--tag`. `ls`, `find` and `tag` take `-p/--print-path`.
